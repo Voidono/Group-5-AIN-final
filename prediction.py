@@ -1,10 +1,10 @@
 # prediction.py
 """
 ================================================================================
-CODE 1: HỆ THỐNG DỰ ĐOÁN BÃO - PHIÊN BẢN ĐẦY ĐỦ
+CODE 1: HỆ THỐNG DỰ ĐOÁN BÃO - PHIÊN BẢN ĐẦY ĐỦ (SỬ DỤNG HMM)
 ================================================================================
 Tính năng:
-1. Train model LSTM và lưu (.keras)
+1. Train model HMM và lưu (.pkl)
 2. Trích xuất bão từ dataset với format chuẩn
 3. Dự đoán bão từ N bước đầu
 4. Export CSV chuẩn cho A* navigation
@@ -19,16 +19,203 @@ SID,NAME,SEASON,LAT,LON,WMO_WIND,DIST2LAND,ISO_TIME,FORECAST_TYPE
 
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from tensorflow import keras
-from tensorflow.keras import layers
 from sklearn.preprocessing import MinMaxScaler
 import pickle
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
 from datetime import datetime, timedelta
+from tqdm import tqdm
 import warnings
+from scipy.special import logsumexp
 warnings.filterwarnings('ignore')
+
+class GaussianHMM:
+    def __init__(self, n_states, n_features, random_state=None):
+        self.n_states = n_states
+        self.n_features = n_features
+        self.random_state = random_state
+        
+        # Initialize parameters
+        rng = np.random.RandomState(random_state)
+        
+        # Initial state probabilities
+        self.start_prob = np.ones(n_states) / n_states
+        
+        # Transition probabilities
+        self.transmat = rng.dirichlet(np.ones(n_states), size=n_states)
+        
+        # Means and variances for each state
+        self.means = rng.randn(n_states, n_features)
+        self.variances = np.ones((n_states, n_features)) * 1.0
+        
+    def _gaussian_pdf(self, x, mean, variance):
+        """Compute Gaussian probability density function."""
+        exponent = -0.5 * np.sum(((x - mean) / np.sqrt(variance)) ** 2)
+        coefficient = 1.0 / (np.sqrt((2 * np.pi) ** self.n_features * np.prod(variance)))
+        return coefficient * np.exp(exponent)
+    
+    def _forward(self, obs):
+        """Forward algorithm in log space."""
+        T = len(obs)
+        N = self.n_states
+        log_alpha = np.full((T, N), -np.inf)
+        
+        log_emit = np.zeros(N)
+        for j in range(N):
+            log_emit[j] = np.log(self._gaussian_pdf(obs[0], self.means[j], self.variances[j]) + 1e-10)
+        log_alpha[0] = np.log(self.start_prob + 1e-10) + log_emit
+        
+        for t in range(1, T):
+            log_emit = np.zeros(N)
+            for j in range(N):
+                log_emit[j] = np.log(self._gaussian_pdf(obs[t], self.means[j], self.variances[j]) + 1e-10)
+                log_terms = log_alpha[t-1] + np.log(self.transmat[:, j] + 1e-10)
+                log_alpha[t, j] = logsumexp(log_terms) + log_emit[j]
+        
+        return log_alpha
+    
+    def _backward(self, obs):
+        """Backward algorithm in log space."""
+        T = len(obs)
+        N = self.n_states
+        log_beta = np.zeros((T, N))
+        
+        for t in range(T-2, -1, -1):
+            log_emit = np.zeros(N)
+            for j in range(N):
+                log_emit[j] = np.log(self._gaussian_pdf(obs[t+1], self.means[j], self.variances[j]) + 1e-10)
+            for i in range(N):
+                log_terms = np.log(self.transmat[i, :] + 1e-10) + log_emit + log_beta[t+1]
+                log_beta[t, i] = logsumexp(log_terms)
+        
+        return log_beta
+    
+    def _baum_welch(self, obs_list):
+        """Baum-Welch for multiple sequences."""
+        N = self.n_states
+        xi_sum = np.zeros((N, N))
+        obs_count_sum = np.zeros(N)
+        weighted_obs_sum = np.zeros((N, self.n_features))
+        weighted_sq_sum = np.zeros((N, self.n_features))
+        start_gamma_sum = np.zeros(N)
+        
+        for obs in obs_list:
+            if len(obs) < 2:
+                continue
+            T = len(obs)
+            log_alpha = self._forward(obs)
+            log_beta = self._backward(obs)
+            log_lik = logsumexp(log_alpha[-1])
+            if np.isinf(log_lik) or np.isnan(log_lik):
+                continue  # Skip bad sequences
+            
+            log_gamma = log_alpha + log_beta - log_lik
+            gamma = np.exp(log_gamma)
+            
+            start_gamma_sum += gamma[0]
+            
+            obs_count_sum += np.sum(gamma, axis=0)
+            weighted_obs_sum += np.dot(gamma.T, obs)
+            weighted_sq_sum += np.dot(gamma.T, obs**2)
+            
+            log_emit = np.zeros((T, N))
+            for t in range(T):
+                for j in range(N):
+                    log_emit[t, j] = np.log(self._gaussian_pdf(obs[t], self.means[j], self.variances[j]) + 1e-10)
+            
+            for t in range(T-1):
+                log_xi = log_alpha[t, :, np.newaxis] + \
+                         np.log(self.transmat + 1e-10) + \
+                         log_emit[t+1, np.newaxis, :] + \
+                         log_beta[t+1, np.newaxis, :] - log_lik
+                xi_sum += np.exp(log_xi)
+        
+        # M-step
+        # Transition matrix
+        row_sums = np.sum(xi_sum, axis=1, keepdims=True)
+        self.transmat = xi_sum / row_sums
+        nan_rows = np.isnan(self.transmat).any(axis=1)
+        self.transmat[nan_rows] = 1.0 / N
+        
+        # Start probabilities
+        sum_start = np.sum(start_gamma_sum)
+        if sum_start > 0:
+            self.start_prob = start_gamma_sum / sum_start
+        else:
+            self.start_prob = np.ones(N) / N
+        
+        # Means and variances
+        for i in range(N):
+            if obs_count_sum[i] > 0:
+                self.means[i] = weighted_obs_sum[i] / obs_count_sum[i]
+                var = weighted_sq_sum[i] / obs_count_sum[i] - (self.means[i] ** 2)
+                self.variances[i] = np.maximum(var, 1e-6)
+    
+    def fit(self, obs_list, n_iter=100):
+        if not isinstance(obs_list, list):
+            obs_list = [obs_list]
+        for _ in tqdm(range(n_iter)):
+            old_loglik = self.score(obs_list)
+            self._baum_welch(obs_list)
+            new_loglik = self.score(obs_list)
+            if abs(new_loglik - old_loglik) < 1e-6:
+                break
+    
+    def score(self, obs):
+        if isinstance(obs, list):
+            return sum(self.score(o) for o in obs if len(o) >= 1)
+        log_alpha = self._forward(obs)
+        return logsumexp(log_alpha[-1])
+    
+    def predict(self, obs):
+        """Viterbi in log space."""
+        T = len(obs)
+        N = self.n_states
+        log_delta = np.full((T, N), -np.inf)
+        psi = np.zeros((T, N), dtype=int)
+        
+        log_emit = np.zeros((T, N))
+        for t in range(T):
+            for j in range(N):
+                log_emit[t, j] = np.log(self._gaussian_pdf(obs[t], self.means[j], self.variances[j]) + 1e-10)
+        
+        log_delta[0] = np.log(self.start_prob + 1e-10) + log_emit[0]
+        psi[0] = 0
+        
+        for t in range(1, T):
+            for j in range(N):
+                log_probs = log_delta[t-1] + np.log(self.transmat[:, j] + 1e-10)
+                psi[t, j] = np.argmax(log_probs)
+                log_delta[t, j] = log_probs[psi[t, j]] + log_emit[t, j]
+        
+        best_last_state = np.argmax(log_delta[-1])
+        path = np.zeros(T, dtype=int)
+        path[T-1] = best_last_state
+        for t in range(T-2, -1, -1):
+            path[t] = psi[t+1, path[t+1]]
+        
+        return path
+
+    def sample(self, n_steps=1, current_state=None):
+        """Sample future observations from the model, starting from a given state."""
+        predictions = []
+        if current_state is None:
+            current_state = np.random.choice(range(self.n_states), p=self.start_prob)
+        
+        for _ in range(n_steps):
+            # Transition to next state
+            p = self.transmat[current_state]
+            p = p / np.sum(p) if np.sum(p) > 0 else np.ones(self.n_states) / self.n_states  # Fix if sum 0
+            if np.any(np.isnan(p)):
+                p = np.nan_to_num(p, nan=1.0/self.n_states)
+            current_state = np.random.choice(range(self.n_states), p=p)
+            
+            # Emit observation
+            std = np.sqrt(self.variances[current_state])
+            std[std == 0] = 1e-3  # Avoid zero std
+            next_obs = np.random.normal(self.means[current_state], std)
+            
+            predictions.append(next_obs)
+        
+        return np.array(predictions)
 
 class TyphoonDataProcessor:
     def __init__(self, sequence_length=8):
@@ -64,61 +251,35 @@ class TyphoonDataProcessor:
 
     def create_sequences(self, df):
         print("\n🔧 Đang tạo training sequences...")
-        X_sequences = []
-        y_sequences = []
-        storm_ids = []
-
+        all_obs = []
         for sid in df['SID'].unique():
             storm = df[df['SID'] == sid].copy()
             if len(storm) < self.sequence_length + 1:
                 continue
+            features = np.column_stack([
+                storm['LAT'].values,
+                storm['LON'].values,
+                storm['WMO_WIND'].fillna(50).values,
+                storm['DIST2LAND'].fillna(200).values
+            ]).astype(float)
+            all_obs.append(features)
+        print(f"✓ Tạo được {len(all_obs)} sequences")
+        return all_obs
 
-            lats = storm['LAT'].values
-            lons = storm['LON'].values
-            winds = storm['WMO_WIND'].fillna(50).values
-            dists = storm['DIST2LAND'].fillna(200).values
-
-            for i in range(len(storm) - self.sequence_length):
-                seq_lat = lats[i:i + self.sequence_length]
-                seq_lon = lons[i:i + self.sequence_length]
-                seq_wind = winds[i:i + self.sequence_length]
-                seq_dist = dists[i:i + self.sequence_length]
-
-                target_lat = lats[i + self.sequence_length]
-                target_lon = lons[i + self.sequence_length]
-
-                X = np.column_stack([seq_lat, seq_lon, seq_wind, seq_dist])
-                y = np.array([target_lat, target_lon])
-
-                X_sequences.append(X)
-                y_sequences.append(y)
-                storm_ids.append(sid)
-
-        X = np.array(X_sequences)
-        y = np.array(y_sequences)
-
-        print(f"✓ Tạo được {len(X):,} sequences")
-        return X, y, storm_ids
-
-    def normalize(self, X, y, fit=True):
-        X_norm = X.copy()
-        y_norm = y.copy()
-
+    def normalize(self, obs, fit=True):
+        obs_norm = obs.copy()
         if fit:
-            self.scaler_lat.fit(X[:, :, 0].reshape(-1, 1))
-            self.scaler_lon.fit(X[:, :, 1].reshape(-1, 1))
-            self.scaler_wind.fit(X[:, :, 2].reshape(-1, 1))
-            self.scaler_dist.fit(X[:, :, 3].reshape(-1, 1))
+            self.scaler_lat.fit(obs[:, 0].reshape(-1, 1))
+            self.scaler_lon.fit(obs[:, 1].reshape(-1, 1))
+            self.scaler_wind.fit(obs[:, 2].reshape(-1, 1))
+            self.scaler_dist.fit(obs[:, 3].reshape(-1, 1))
 
-        X_norm[:, :, 0] = self.scaler_lat.transform(X[:, :, 0].reshape(-1, 1)).reshape(X[:, :, 0].shape)
-        X_norm[:, :, 1] = self.scaler_lon.transform(X[:, :, 1].reshape(-1, 1)).reshape(X[:, :, 1].shape)
-        X_norm[:, :, 2] = self.scaler_wind.transform(X[:, :, 2].reshape(-1, 1)).reshape(X[:, :, 2].shape)
-        X_norm[:, :, 3] = self.scaler_dist.transform(X[:, :, 3].reshape(-1, 1)).reshape(X[:, :, 3].shape)
+        obs_norm[:, 0] = self.scaler_lat.transform(obs[:, 0].reshape(-1, 1)).reshape(-1)
+        obs_norm[:, 1] = self.scaler_lon.transform(obs[:, 1].reshape(-1, 1)).reshape(-1)
+        obs_norm[:, 2] = self.scaler_wind.transform(obs[:, 2].reshape(-1, 1)).reshape(-1)
+        obs_norm[:, 3] = self.scaler_dist.transform(obs[:, 3].reshape(-1, 1)).reshape(-1)
 
-        y_norm[:, 0] = self.scaler_lat.transform(y[:, 0].reshape(-1, 1)).reshape(-1)
-        y_norm[:, 1] = self.scaler_lon.transform(y[:, 1].reshape(-1, 1)).reshape(-1)
-
-        return X_norm, y_norm
+        return obs_norm
 
     def denormalize_output(self, y_norm):
         y = y_norm.copy()
@@ -126,67 +287,34 @@ class TyphoonDataProcessor:
         y[:, 1] = self.scaler_lon.inverse_transform(y[:, 1].reshape(-1, 1)).reshape(-1)
         return y
 
-class TyphoonLSTM:
-    def __init__(self, sequence_length=8, n_features=4):
-        self.sequence_length = sequence_length
+class TyphoonHMM:
+    def __init__(self, n_states=8, n_features=4, random_state=42):
+        self.n_states = n_states
         self.n_features = n_features
-        self.model = None
+        self.model = GaussianHMM(n_states, n_features, random_state)
 
-    def build_model(self):
-        print("\n🏗️  Xây dựng mô hình LSTM...")
-        model = keras.Sequential([
-            layers.LSTM(128, return_sequences=True,
-                       input_shape=(self.sequence_length, self.n_features), name='lstm_1'),
-            layers.Dropout(0.2),
-            layers.LSTM(64, return_sequences=False, name='lstm_2'),
-            layers.Dropout(0.2),
-            layers.Dense(32, activation='relu'),
-            layers.Dense(2, name='output')
-        ])
-
-        model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001),
-                     loss='mse', metrics=['mae'])
-        self.model = model
-        print("✓ Mô hình đã sẵn sàng!")
-        return self
-
-    def train(self, X_train, y_train, X_val, y_val, epochs=50):
-        print("\n🎓 Bắt đầu huấn luyện...")
-        early_stop = keras.callbacks.EarlyStopping(
-            monitor='val_loss', patience=10, restore_best_weights=True)
-        reduce_lr = keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss', factor=0.5, patience=5, min_lr=0.00001)
-
-        history = self.model.fit(
-            X_train, y_train,
-            validation_data=(X_val, y_val),
-            epochs=epochs, batch_size=32,
-            callbacks=[early_stop, reduce_lr],
-            verbose=1
-        )
+    def train(self, obs_list_norm, epochs=50):
+        print("\n🎓 Bắt đầu huấn luyện HMM...")
+        self.model.fit(obs_list_norm, n_iter=epochs)
         print("✓ Huấn luyện hoàn tất!")
-        return history
 
-    def predict_trajectory(self, initial_sequence, n_steps=24):
-        predictions = []
-        current_seq = initial_sequence.copy()
-
-        for step in range(n_steps):
-            next_point = self.model.predict(current_seq[np.newaxis, :, :], verbose=0)[0]
-            predictions.append(next_point)
-
-            new_step = np.array([
-                next_point[0], next_point[1],
-                current_seq[-1, 2], current_seq[-1, 3]
-            ])
-            current_seq = np.vstack([current_seq[1:], new_step])
-
-        return np.array(predictions)
+    def predict_trajectory(self, initial_sequence_norm, n_steps=24):
+        # Infer states on initial sequence
+        states = self.model.predict(initial_sequence_norm)
+        last_state = states[-1]
+        
+        # Sample future observations (full features)
+        pred_norm = self.model.sample(n_steps, current_state=last_state)
+        
+        # Extract only LAT/LON (first 2 features)
+        predictions = pred_norm[:, :2]  # Assuming [lat, lon, wind, dist]
+        return predictions
 
     def save_model(self, model_path, scaler_path, processor):
-        """Lưu model (.keras) và scaler"""
+        """Lưu model (.pkl) và scaler"""
         print(f"\n💾 Đang lưu model...")
-        self.model.save(model_path)  # Tự động lưu .keras
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.model, f)
 
         scaler_data = {
             'scaler_lat': processor.scaler_lat,
@@ -203,10 +331,10 @@ class TyphoonLSTM:
 
     @staticmethod
     def load_model(model_path, scaler_path):
-        """Load model (.keras) và scaler"""
+        """Load model (.pkl) và scaler"""
         print(f"\n📥 Đang load model...")
-        lstm = TyphoonLSTM()
-        lstm.model = keras.models.load_model(model_path)
+        with open(model_path, 'rb') as f:
+            hmm_model = pickle.load(f)
 
         with open(scaler_path, 'rb') as f:
             scaler_data = pickle.load(f)
@@ -217,29 +345,30 @@ class TyphoonLSTM:
         processor.scaler_wind = scaler_data['scaler_wind']
         processor.scaler_dist = scaler_data['scaler_dist']
 
+        model = TyphoonHMM()
+        model.model = hmm_model
+
         print(f"✅ Load thành công!")
-        return lstm, processor
+        return model, processor
 
 def train_and_save_model(csv_path, model_path, scaler_path):
     """Train model và lưu"""
     print("="*80)
-    print("🌀 TRAINING MÔ HÌNH DỰ ĐOÁN BÃO")
+    print("🌀 TRAINING MÔ HÌNH DỰ ĐOÁN BÃO (HMM)")
     print("="*80)
 
     processor = TyphoonDataProcessor(sequence_length=8)
     df = processor.load_and_clean(csv_path)
-    X, y, storm_ids = processor.create_sequences(df)
+    obs_list = processor.create_sequences(df)
 
-    split_idx = int(len(X) * 0.8)
-    X_train, X_val = X[:split_idx], X[split_idx:]
-    y_train, y_val = y[:split_idx], y[split_idx:]
+    # Normalize: Fit on all data combined
+    all_obs = np.vstack(obs_list)
+    processor.normalize(all_obs, fit=True)
+    # Normalize each sequence
+    obs_list_norm = [processor.normalize(obs, fit=False) for obs in obs_list]
 
-    X_train_norm, y_train_norm = processor.normalize(X_train, y_train, fit=True)
-    X_val_norm, y_val_norm = processor.normalize(X_val, y_val, fit=False)
-
-    model = TyphoonLSTM(sequence_length=8, n_features=4)
-    model.build_model()
-    history = model.train(X_train_norm, y_train_norm, X_val_norm, y_val_norm, epochs=50)
+    model = TyphoonHMM(n_states=8, n_features=4)
+    model.train(obs_list_norm, epochs=50)
 
     model.save_model(model_path, scaler_path, processor)
 
@@ -354,7 +483,7 @@ def predict_from_storm_steps(model, processor, storm_df, start_step=0,
     Dự đoán bão từ N bước đầu
 
     Args:
-        model: TyphoonLSTM model
+        model: TyphoonHMM model
         processor: TyphoonDataProcessor
         storm_df: DataFrame bão (từ extract_storm_by_name)
         start_step: Bắt đầu từ bước nào (0 = từ đầu)
@@ -382,17 +511,13 @@ def predict_from_storm_steps(model, processor, storm_df, start_step=0,
     winds = input_data['WMO_WIND'].fillna(50).values
     dists = input_data['DIST2LAND'].fillna(200).values
 
-    X_raw = np.column_stack([lats, lons, winds, dists]).reshape(1, n_input_steps, 4).astype(float)
+    X_raw = np.column_stack([lats, lons, winds, dists]).astype(float)
 
     # Normalize
-    X_norm = X_raw.copy()
-    X_norm[0, :, 0] = processor.scaler_lat.transform(X_raw[0, :, 0].reshape(-1, 1)).reshape(-1)
-    X_norm[0, :, 1] = processor.scaler_lon.transform(X_raw[0, :, 1].reshape(-1, 1)).reshape(-1)
-    X_norm[0, :, 2] = processor.scaler_wind.transform(X_raw[0, :, 2].reshape(-1, 1)).reshape(-1)
-    X_norm[0, :, 3] = processor.scaler_dist.transform(X_raw[0, :, 3].reshape(-1, 1)).reshape(-1)
+    X_norm = processor.normalize(X_raw, fit=False)
 
     # Predict
-    pred_norm = model.predict_trajectory(X_norm[0], n_steps=n_predict_steps)
+    pred_norm = model.predict_trajectory(X_norm, n_steps=n_predict_steps)
     predictions = processor.denormalize_output(pred_norm)
 
     print(f"✅ Dự đoán xong!")
@@ -427,55 +552,16 @@ def predict_from_storm_steps(model, processor, storm_df, start_step=0,
         result_df.to_csv(output_csv, index=False)
         print(f"💾 Đã lưu: {output_csv}")
 
-    # Vẽ
-    _plot_forecast(result_df)
-
     return result_df
-
-def _plot_forecast(forecast_df):
-    """Vẽ bão observed + predicted"""
-    fig = plt.figure(figsize=(18, 12))
-    ax = plt.axes(projection=ccrs.PlateCarree())
-
-    ax.set_extent([100, 130, 5, 25], crs=ccrs.PlateCarree())
-    ax.add_feature(cfeature.LAND, facecolor='#c8e6c9', zorder=1)
-    ax.add_feature(cfeature.OCEAN, facecolor='#e3f2fd', zorder=0)
-    ax.add_feature(cfeature.COASTLINE, linewidth=2, edgecolor='#2e7d32', zorder=3)
-
-    gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
-    gl.top_labels = False
-    gl.right_labels = False
-
-    # Observed
-    obs = forecast_df[forecast_df['FORECAST_TYPE'] == 'observed']
-    ax.plot(obs['LON'], obs['LAT'], 'b-', linewidth=3,
-           label=f'Quan sát ({len(obs)} điểm)', transform=ccrs.PlateCarree(), zorder=5)
-    ax.scatter(obs['LON'], obs['LAT'], c='blue', s=150, marker='o',
-              edgecolors='white', linewidths=2, transform=ccrs.PlateCarree(), zorder=6)
-
-    # Predicted
-    pred = forecast_df[forecast_df['FORECAST_TYPE'] == 'predicted']
-    ax.plot(pred['LON'], pred['LAT'], 'r--', linewidth=3,
-           label=f'Dự đoán ({len(pred)} điểm = {len(pred)*3}h)', transform=ccrs.PlateCarree(), zorder=5)
-    ax.scatter(pred['LON'], pred['LAT'], c='red', s=150, marker='^',
-              edgecolors='white', linewidths=2, transform=ccrs.PlateCarree(), zorder=6)
-
-    storm_name = forecast_df['NAME'].iloc[0]
-    storm_year = int(forecast_df['SEASON'].iloc[0])
-    ax.set_title(f'🌀 BÃO {storm_name} ({storm_year})', fontsize=20, fontweight='bold', pad=15)
-    ax.legend(fontsize=14, loc='upper left')
-
-    plt.tight_layout()
-    plt.show()
 
 if __name__ == "__main__":
     # ===== CẤU HÌNH ĐƯỜNG DẪN =====
     csv_path = 'ibtracs.WP.list.v04r00.csv'
-    model_path = 'typhoon_model.keras'  # ← .keras
+    model_path = 'typhoon_hmm.pkl'  # ← .pkl
     scaler_path = 'typhoon_scaler.pkl'
 
     print("\n" + "="*80)
-    print("🌀 HỆ THỐNG DỰ ĐOÁN BÃO - WORKFLOW ĐẦY ĐỦ")
+    print("🌀 HỆ THỐNG DỰ ĐOÁN BÃO - WORKFLOW ĐẦY ĐỦ (HMM)")
     print("="*80)
 
     # ===== BƯỚC 1: TRAIN MODEL (CHẠY 1 LẦN ĐẦU) =====
@@ -487,7 +573,7 @@ if __name__ == "__main__":
     # ===== BƯỚC 2: LOAD MODEL (CÁC LẦN SAU) =====
     print("\n[Bước 2] LOAD MODEL ĐÃ TRAIN")
     print("-" * 80)
-    model, processor = TyphoonLSTM.load_model(model_path, scaler_path)
+    model, processor = TyphoonHMM.load_model(model_path, scaler_path)
     processor_temp = TyphoonDataProcessor()
     df = processor_temp.load_and_clean(csv_path)
 
